@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-/// Library errors
+/// Library errors.
 #[derive(Debug, Error)]
 pub enum SorError {
     #[error("SOR parsing error: {0}")]
