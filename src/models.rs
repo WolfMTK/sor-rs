@@ -421,3 +421,15 @@ impl RawBlock {
         self.data.len()
     }
 }
+
+#[derive(Debug, Default)]
+pub struct SorFile {
+    pub map_block: Option<MapBlock>,
+    pub gen_params: Option<GenParams>,
+    pub sup_params: Option<SupParams>,
+    pub fxd_params: Option<FxdParams>,
+    pub key_events: Option<KeyEvents>,
+    pub data_points: Option<DataPoints>,
+    pub checksum: Option<Checksum>,
+    pub raw_blocks: HashMap<String, RawBlock>,
+}
