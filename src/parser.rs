@@ -502,3 +502,523 @@ pub fn crc16(data: &[u8]) -> u16 {
     }
     crc
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::errors::SorError;
+    use crate::models::SorFile;
+    use crate::parser::crc16;
+    use rstest::{fixture, rstest};
+
+    fn sample(name: &str) -> String {
+        format!("{}/data/{name}", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    #[fixture]
+    fn noyes() -> String { sample("example1-noyes-ofl280.sor") }
+
+    #[fixture]
+    fn noyes_fast() -> String { sample("example1-noyes-ofl280-fastreporter-save.sor") }
+
+    #[fixture]
+    fn exfo_max() -> String { sample("example2-exfo-maxtester730c.sor") }
+
+    #[fixture]
+    fn anritsu() -> String { sample("example3-anritsu-accessmastermt9085.sor") }
+
+    #[fixture]
+    fn exfo_1310() -> String { sample("example4-exfo-ftb4ftbx730c-mfdgainer-1310nm.sor") }
+
+    #[fixture]
+    fn exfo_1550() -> String { sample("example4-exfo-ftb4ftbx730c-mfdgainer-1550nm.sor") }
+
+    #[fixture]
+    fn exfo_rtu() -> String { sample("example5-exfo-rtu2ftbx735c-sm7r-ea-hrd.sor") }
+
+    #[fixture]
+    fn sor_file(#[from(noyes)] path: String) -> SorFile {
+        SorFile::from_file(&path, false).unwrap()
+    }
+
+    #[rstest]
+    fn invalid_magic_raises() {
+        let bad = b"NOTSOR\x00"
+            .iter()
+            .chain(b"\x00".iter().cycle().take(100))
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(matches!(SorFile::from_bytes(&bad, false), Err(SorError::ParseError(_))));
+    }
+
+    #[rstest]
+    fn file_not_found_raises() {
+        let res = SorFile::from_file("/no/such/file.sor", false);
+        assert!(matches!(res, Err(SorError::IOError(_))));
+    }
+
+    #[rstest]
+    fn parse_without_error(
+        noyes: String,
+        noyes_fast: String,
+        exfo_max: String,
+        anritsu: String,
+        exfo_1310: String,
+        exfo_1550: String,
+        exfo_rtu: String,
+    ) {
+        for path in &[noyes, noyes_fast, exfo_max, anritsu, exfo_1310, exfo_1550, exfo_rtu] {
+            SorFile::from_file(path, false)
+                .unwrap_or_else(|e| panic!("Failed to parse {path}: {e}"));
+        }
+    }
+
+    #[rstest]
+    fn from_bytes(
+        noyes: String,
+        noyes_fast: String,
+        exfo_max: String,
+        anritsu: String,
+        exfo_1310: String,
+        exfo_1550: String,
+        exfo_rtu: String,
+    ) {
+        for path in &[noyes, noyes_fast, exfo_max, anritsu, exfo_1310, exfo_1550, exfo_rtu] {
+            let data = std::fs::read(path).unwrap();
+            SorFile::from_bytes(&data, false)
+                .unwrap_or_else(|e| panic!("Failed from_bytes {path}: {e}"));
+        }
+    }
+
+    #[rstest]
+    fn map_block_present(sor_file: SorFile) {
+        let map = sor_file.map_block.as_ref().unwrap();
+        assert_eq!(map.version, 200);
+        assert_eq!(map.version_str(), "2.00");
+    }
+
+    #[rstest]
+    fn map_block_required_keys(sor_file: SorFile) {
+        let map = sor_file.map_block.as_ref().unwrap();
+        for key in &["GenParams", "SupParams", "FxdParams", "KeyEvents", "DataPts", "Cksum"] {
+            assert!(map.blocks.contains_key(*key), "Missing block: {key}");
+        }
+    }
+
+    #[rstest]
+    fn map_offsets_sequential(sor_file: SorFile) {
+        let map = sor_file.map_block.as_ref().unwrap();
+        let mut sorted: Vec<_> = map.blocks.values().collect();
+        sorted.sort_by_key(|b| b.offset);
+        for w in sorted.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            assert_eq!(
+                a.offset + a.size as usize,
+                b.offset,
+                "Blocks {} and {} are not contiguous",
+                a.name,
+                b.name
+            );
+        }
+    }
+
+    #[rstest]
+    fn map_all_files(
+        noyes: String,
+        noyes_fast: String,
+        exfo_max: String,
+        anritsu: String,
+        exfo_1310: String,
+        exfo_1550: String,
+        exfo_rtu: String,
+    ) {
+        for path in &[noyes, noyes_fast, exfo_max, anritsu, exfo_1310, exfo_1550, exfo_rtu] {
+            let sor = SorFile::from_file(path, false).unwrap();
+            assert!(sor.map_block.as_ref().unwrap().num_blocks() > 0);
+        }
+    }
+
+    #[rstest]
+    fn gen_params_noyes(sor_file: SorFile) {
+        let gp = sor_file.gen_params.as_ref().unwrap();
+        assert_eq!(gp.language, "EN");
+        assert_eq!(gp.language.len(), 2);
+        assert!(gp.fiber_type_code > 0);
+        let wl = gp.wavelength_nm;
+        assert!(
+            (100.0..=200.0).contains(&wl) || (1000.0..=1700.0).contains(&wl),
+            "Unrealistic wavelength: {wl}"
+        );
+    }
+
+    #[rstest]
+    fn gen_params_fiber_type_str(sor_file: SorFile) {
+        let gp = sor_file.gen_params.as_ref().unwrap();
+        assert!(gp.fiber_type_str().contains("G.652"));
+    }
+
+    #[rstest]
+    fn gen_params_all_files(
+        noyes: String,
+        noyes_fast: String,
+        exfo_max: String,
+        anritsu: String,
+        exfo_1310: String,
+        exfo_1550: String,
+        exfo_rtu: String,
+    ) {
+        for path in &[noyes, noyes_fast, exfo_max, anritsu, exfo_1310, exfo_1550, exfo_rtu] {
+            let sor = SorFile::from_file(path, false).unwrap();
+            let gp = sor.gen_params.as_ref().expect("GenParams missing");
+            assert_eq!(gp.language.len(), 2, "Invalid language in {path}");
+        }
+    }
+
+    #[rstest]
+    fn sup_params_noyes_supplier(sor_file: SorFile) {
+        let sp = sor_file.sup_params.as_ref().unwrap();
+        assert!(sp.supplier.contains("Noyes"), "Supplier: {:?}", sp.supplier);
+        assert!(sp.otdr_name.contains("OFL280"), "Model: {:?}", sp.otdr_name);
+    }
+
+    #[rstest]
+    fn sup_params_anritsu(anritsu: String) {
+        let sor = SorFile::from_file(anritsu, false).unwrap();
+        let sp = sor.sup_params.as_ref().unwrap();
+        let has_info =
+            !sp.supplier.is_empty() || !sp.otdr_name.is_empty() || !sp.module_name.is_empty();
+        assert!(has_info);
+    }
+
+    #[rstest]
+    fn sup_params_all_files(
+        noyes: String,
+        noyes_fast: String,
+        exfo_max: String,
+        anritsu: String,
+        exfo_1310: String,
+        exfo_1550: String,
+        exfo_rtu: String,
+    ) {
+        for path in &[noyes, noyes_fast, exfo_max, anritsu, exfo_1310, exfo_1550, exfo_rtu] {
+            let sor = SorFile::from_file(path, false).unwrap();
+            assert!(sor.sup_params.is_some(), "SupParams missing in {path}");
+        }
+    }
+
+    #[rstest]
+    fn fxd_params_noyes(sor_file: SorFile) {
+        let fp = sor_file.fxd_params.as_ref().unwrap();
+
+        assert!(fp.timestamp > 946_684_800, "Timestamp is too early");
+        assert!(fp.timestamp < 2_208_988_800, "Timestamp is too late");
+
+        assert_eq!(fp.unit, "mt");
+
+        assert!((1.4..=1.6).contains(&fp.group_index), "n = {}", fp.group_index);
+
+        assert_eq!(fp.num_data_points, 30000);
+
+        assert_eq!(fp.pulse_widths_ns, vec![30u16]);
+
+        let sol = 0.299_792_458_f64;
+        let expected_dx = fp.sample_spacing_raw as f64 * 1e-8 * sol / fp.group_index * 1000.0;
+        assert!((fp.resolution_m() - expected_dx).abs() < 1e-9);
+
+        let expected_range = fp.acquisition_range_raw as f64 * 2e-5;
+        assert!((fp.range_km() - expected_range).abs() < 1e-9);
+    }
+
+    #[rstest]
+    fn fxd_params_resolution_realistic(
+        noyes: String,
+        noyes_fast: String,
+        exfo_max: String,
+        anritsu: String,
+        exfo_1310: String,
+        exfo_1550: String,
+        exfo_rtu: String,
+    ) {
+        for path in &[noyes, noyes_fast, exfo_max, anritsu, exfo_1310, exfo_1550, exfo_rtu] {
+            let sor = SorFile::from_file(path, false).unwrap();
+            let fp = sor.fxd_params.as_ref().unwrap();
+            let r = fp.resolution_m();
+            assert!(r > 0.0 && r < 100.0, "Unrealistic resolution {r:.4} in {path}");
+        }
+    }
+
+    #[rstest]
+    fn fxd_params_group_index_realistic(
+        noyes: String,
+        noyes_fast: String,
+        exfo_max: String,
+        anritsu: String,
+        exfo_1310: String,
+        exfo_1550: String,
+        exfo_rtu: String,
+    ) {
+        for path in &[noyes, noyes_fast, exfo_max, anritsu, exfo_1310, exfo_1550, exfo_rtu] {
+            let sor = SorFile::from_file(path, false).unwrap();
+            let n = sor.fxd_params.as_ref().unwrap().group_index;
+            assert!((1.4..=1.6).contains(&n), "n={n} in {path}");
+        }
+    }
+
+    #[rstest]
+    fn fxd_params_distance_factor_formula(sor_file: SorFile) {
+        let fp = sor_file.fxd_params.as_ref().unwrap();
+        let sol = 0.299_792_458_f64;
+        let expected = 1e-4 * sol / fp.group_index;
+        assert!((fp.distance_factor_km() - expected).abs() < 1e-15);
+    }
+
+    #[rstest]
+    fn key_events_noyes_count(sor_file: SorFile) {
+        let ke = sor_file.key_events.as_ref().unwrap();
+        assert_eq!(ke.num_events(), 3);
+    }
+
+    #[rstest]
+    fn key_events_first_is_reflection(sor_file: SorFile) {
+        let ke = sor_file.key_events.as_ref().unwrap();
+        let first = &ke.events[0];
+        assert!(
+            first.is_reflection(),
+            "First event must be a reflection: {:?}",
+            first.event_type
+        );
+    }
+
+    #[rstest]
+    fn key_events_type_length(sor_file: SorFile) {
+        let ke = sor_file.key_events.as_ref().unwrap();
+        for ev in &ke.events {
+            assert_eq!(ev.event_type.len(), 8, "Event type length: {:?}", ev.event_type);
+        }
+    }
+
+    #[rstest]
+    fn key_events_distances_non_negative(
+        noyes: String,
+        noyes_fast: String,
+        exfo_max: String,
+        anritsu: String,
+        exfo_1310: String,
+        exfo_1550: String,
+        exfo_rtu: String,
+    ) {
+        for path in &[noyes, noyes_fast, exfo_max, anritsu, exfo_1310, exfo_1550, exfo_rtu] {
+            let sor = SorFile::from_file(path, false).unwrap();
+            let ke = sor.key_events.as_ref().unwrap();
+            for ev in &ke.events {
+                assert!(ev.distance_km >= 0.0, "Negative distance in {path}");
+            }
+        }
+    }
+
+    #[rstest]
+    fn key_events_noyes_distances(sor_file: SorFile) {
+        let ke = sor_file.key_events.as_ref().unwrap();
+        let ev1 = &ke.events[0];
+        let ev2 = &ke.events[1];
+        let ev3 = &ke.events[2];
+        assert!((ev1.distance_km - 0.0).abs() < 0.001);
+        assert!((ev2.distance_km - 0.011).abs() < 0.001, "ev2 dist = {:.4}", ev2.distance_km);
+        assert!((ev3.distance_km - 3.734).abs() < 0.01, "ev3 dist = {:.4}", ev3.distance_km);
+    }
+
+    #[rstest]
+    fn key_events_summary_orl_realistic(
+        noyes: String,
+        noyes_fast: String,
+        exfo_max: String,
+        anritsu: String,
+        exfo_1310: String,
+        exfo_1550: String,
+        exfo_rtu: String,
+    ) {
+        for path in &[noyes, noyes_fast, exfo_max, anritsu, exfo_1310, exfo_1550, exfo_rtu] {
+            let sor = SorFile::from_file(path, false).unwrap();
+            let orl = sor.key_events.as_ref().unwrap().summary.orl_db;
+            assert!((-100.0..=100.0).contains(&orl), "ORL={orl} in {path}");
+        }
+    }
+
+    #[rstest]
+    fn key_events_noyes_summary(sor_file: SorFile) {
+        let s = &sor_file.key_events.as_ref().unwrap().summary;
+        assert!((s.total_loss_db - 0.576).abs() < 0.01, "total_loss={}", s.total_loss_db);
+        assert!((s.orl_db - 24.516).abs() < 0.01, "orl={}", s.orl_db);
+    }
+
+    #[rstest]
+    fn key_events_filter_methods(sor_file: SorFile) {
+        let ke = sor_file.key_events.as_ref().unwrap();
+        assert_eq!(ke.reflections().len(), 1);
+        assert_eq!(ke.loss_events().len(), 1);
+    }
+
+    #[rstest]
+    fn key_events_all_files_positive_count(
+        noyes: String,
+        noyes_fast: String,
+        exfo_max: String,
+        anritsu: String,
+        exfo_1310: String,
+        exfo_1550: String,
+        exfo_rtu: String,
+    ) {
+        for path in &[noyes, noyes_fast, exfo_max, anritsu, exfo_1310, exfo_1550, exfo_rtu] {
+            let sor = SorFile::from_file(path, false).unwrap();
+            assert!(sor.key_events.as_ref().unwrap().num_events() > 0, "{path}");
+        }
+    }
+
+    #[rstest]
+    fn data_points_noyes(sor_file: SorFile) {
+        let dp = sor_file.data_points.as_ref().unwrap();
+        let fp = sor_file.fxd_params.as_ref().unwrap();
+
+        assert_eq!(dp.num_points, fp.num_data_points);
+        assert_eq!(dp.raw_data.len(), 30000);
+        assert_eq!(dp.scaling_factor, 1000);
+    }
+
+    #[rstest]
+    fn data_points_levels_db(sor_file: SorFile) {
+        let dp = sor_file.data_points.as_ref().unwrap();
+        let levels = dp.levels_db();
+        assert_eq!(levels.len(), dp.num_points as usize);
+        for (i, (&raw, &lvl)) in dp.raw_data.iter().zip(levels.iter()).enumerate() {
+            if raw < 65535 {
+                assert!(lvl >= 0.0, "Negative level [{i}]: {lvl}");
+            }
+        }
+    }
+
+    #[rstest]
+    fn data_points_distances_monotonic(sor_file: SorFile) {
+        let dp = sor_file.data_points.as_ref().unwrap();
+        let dists = dp.distances_km();
+        for w in dists.windows(2) {
+            assert!(w[1] >= w[0], "Distances are not monotonic: {} >= {}", w[0], w[1]);
+        }
+    }
+
+    #[rstest]
+    fn data_points_as_arrays(sor_file: SorFile) {
+        let dp = sor_file.data_points.as_ref().unwrap();
+        let (dists, levels) = dp.as_arrays();
+        assert_eq!(dists.len(), levels.len());
+        assert_eq!(dists.len(), dp.num_points as usize);
+    }
+
+    #[rstest]
+    fn data_points_resolution_linked(sor_file: SorFile) {
+        let dp = sor_file.data_points.as_ref().unwrap();
+        let fp = sor_file.fxd_params.as_ref().unwrap();
+        assert!((dp.resolution_m - fp.resolution_m()).abs() < 1e-9);
+    }
+
+    #[rstest]
+    fn data_points_dynamic_range_positive(sor_file: SorFile) {
+        assert!(sor_file.data_points.as_ref().unwrap().dynamic_range_db() > 0.0);
+    }
+
+    #[rstest]
+    fn data_points_start_near_zero(sor_file: SorFile) {
+        let dp = sor_file.data_points.as_ref().unwrap();
+        let first = dp.distances_km()[0];
+        assert!(first.abs() < 1.0, "First distance is too far from 0: {first}");
+    }
+
+    #[rstest]
+    fn data_points_all_files(
+        noyes: String,
+        noyes_fast: String,
+        exfo_max: String,
+        anritsu: String,
+        exfo_1310: String,
+        exfo_1550: String,
+        exfo_rtu: String,
+    ) {
+        for path in &[noyes, noyes_fast, exfo_max, anritsu, exfo_1310, exfo_1550, exfo_rtu] {
+            let sor = SorFile::from_file(path, false).unwrap();
+            let dp = sor.data_points.as_ref().expect("DataPts missing");
+            assert!(dp.num_points > 0);
+            assert_eq!(dp.raw_data.len(), dp.num_points as usize);
+            let (d, l) = dp.as_arrays();
+            assert_eq!(d.len(), l.len());
+        }
+    }
+
+    #[rstest]
+    fn checksum_present(sor_file: SorFile) {
+        assert!(sor_file.checksum.is_some());
+        assert_ne!(sor_file.checksum.unwrap().value, 0);
+    }
+
+    #[rstest]
+    fn checksum_verify_noyes(noyes: String) {
+        SorFile::from_file(noyes, true).expect("CRC should match");
+    }
+
+    #[rstest]
+    fn checksum_wrong_raises(noyes: String) {
+        let mut data = std::fs::read(noyes).unwrap();
+        data[100] ^= 0xFF;
+        let res = SorFile::from_bytes(&data, true);
+        assert!(matches!(res, Err(SorError::ChecksumError { .. })));
+    }
+
+    #[rstest]
+    fn raw_blocks_exfo(exfo_max: String) {
+        let sor = SorFile::from_file(exfo_max, false).unwrap();
+        let has_exfo = sor.raw_blocks.keys().any(|k| k.contains("Exfo") || k.contains("exfo"));
+        assert!(has_exfo || !sor.raw_blocks.is_empty(), "Expected EXFO proprietary blocks");
+    }
+
+    #[rstest]
+    fn raw_blocks_anritsu(anritsu: String) {
+        let sor = SorFile::from_file(anritsu, false).unwrap();
+        assert!(!sor.raw_blocks.is_empty(), "Expected Anritsu proprietary blocks");
+        for (_, rb) in &sor.raw_blocks {
+            assert_eq!(rb.size(), rb.data.len());
+        }
+    }
+
+    #[rstest]
+    fn wavelength_ratio_1310_vs_1550(exfo_1310: String, exfo_1550: String) {
+        let sor1 = SorFile::from_file(exfo_1310, false).unwrap();
+        let sor2 = SorFile::from_file(exfo_1550, false).unwrap();
+        let wl1 = sor1.fxd_params.as_ref().unwrap().wavelength_nm;
+        let wl2 = sor2.fxd_params.as_ref().unwrap().wavelength_nm;
+        assert!(wl1 < wl2, "wl1={wl1} >= wl2={wl2}");
+        let ratio = wl1 / wl2;
+        assert!((0.80..=0.90).contains(&ratio), "ratio={ratio:.3}");
+    }
+
+    #[rstest]
+    fn noyes_vs_fastreporter_group_index(noyes: String, noyes_fast: String) {
+        let sor1 = SorFile::from_file(noyes, false).unwrap();
+        let sor2 = SorFile::from_file(noyes_fast, false).unwrap();
+        let n1 = sor1.fxd_params.as_ref().unwrap().group_index;
+        let n2 = sor2.fxd_params.as_ref().unwrap().group_index;
+        assert!((n1 - n2).abs() < 0.01, "n1={n1} vs n2={n2}");
+    }
+
+    #[rstest]
+    fn crc16_known_value() {
+        let val = crc16(b"123456789");
+        assert_eq!(val, 0x29B1, "CRC-16/CCITT-FALSE: expected 0x29B1, got {val:#06x}");
+    }
+
+    #[rstest]
+    fn crc16_empty() {
+        assert_eq!(crc16(b""), 0xFFFF);
+    }
+
+    #[rstest]
+    fn checksum_verify_selected_files(noyes: String) {
+        SorFile::from_file(noyes, true).expect("Noyes OFL280 file CRC should match");
+    }
+}
