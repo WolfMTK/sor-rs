@@ -1,4 +1,7 @@
+use crate::SorError;
 use crate::constants::SPEED_OF_LIGHT_KM_US;
+use crate::errors::Result;
+use crate::reader::Reader;
 use std::collections::HashMap;
 
 /// Description of a single block from the Map table.
@@ -38,6 +41,50 @@ impl MapBlock {
 
     pub fn num_blocks(&self) -> usize {
         self.blocks.len()
+    }
+
+    pub(crate) fn read_from(reader: &mut Reader) -> Result<(Self, u8)> {
+        let magic = reader.read_bytes(4)?;
+        if magic != b"Map\x00" {
+            return Err(SorError::parse(format!(
+                "Map marker not found: expected b\"Map\\0\", got {:?}",
+                magic
+            )));
+        }
+
+        let version = reader.read_u16_le()?;
+        let map_size = reader.read_u32_le()?;
+        let num_blocks_raw = reader.read_u16_le()?;
+        let data_block_count = (num_blocks_raw as usize).saturating_sub(1);
+
+        let mut blocks = HashMap::with_capacity(data_block_count);
+        let mut running_offset = map_size as usize;
+
+        for _ in 0..data_block_count {
+            let name = reader.read_cstring()?;
+            let block_ver = reader.read_u16_le()?;
+            let block_size = reader.read_u32_le()?;
+            blocks.insert(
+                name.clone(),
+                BlockInfo {
+                    name,
+                    version: block_ver,
+                    size: block_size,
+                    offset: running_offset,
+                },
+            );
+            running_offset += block_size as usize;
+        }
+
+        let format = if version <= 100 { 1 } else { 2 };
+        Ok((
+            MapBlock {
+                version,
+                map_size,
+                blocks,
+            },
+            format,
+        ))
     }
 }
 
@@ -85,6 +132,46 @@ impl GenParams {
             _ => "Unknown",
         }
     }
+
+    pub(crate) fn read_from(reader: &mut Reader, format: u8) -> Result<Self> {
+        let language = reader.read_fixed_str(2)?;
+        let cable_id = reader.read_cstring()?;
+        let fiber_id = reader.read_cstring()?;
+        let fiber_type_code = reader.read_u16_le()?;
+        let wavelength_nm = reader.read_u16_le()? as f64 * 0.1;
+        let location_a = reader.read_cstring()?;
+        let cable_code = reader.read_cstring()?;
+        let build_condition = reader.read_cstring()?;
+        let user_offset_raw = reader.read_i32_le()?;
+
+        let (location_b, user_offset_distance, operator, comments) = if format == 2 {
+            (
+                reader.read_cstring()?,
+                reader.read_i32_le()?,
+                reader.read_cstring()?,
+                reader.read_cstring_opt()?,
+            )
+        } else {
+            let operator = reader.read_cstring_opt()?;
+            (String::new(), 0, operator, String::new())
+        };
+
+        Ok(Self {
+            language,
+            cable_id,
+            fiber_id,
+            fiber_type_code,
+            wavelength_nm,
+            location_a,
+            location_b,
+            cable_code,
+            build_condition,
+            user_offset_raw,
+            user_offset_distance,
+            operator,
+            comments,
+        })
+    }
 }
 
 /// Instrument (OTDR) information.
@@ -104,6 +191,20 @@ pub struct SupParams {
     pub sw_version: String,
     /// Other proprietary supplier information.
     pub other: String,
+}
+
+impl SupParams {
+    pub(crate) fn read_from(reader: &mut Reader) -> Result<Self> {
+        Ok(Self {
+            supplier: reader.read_cstring()?,
+            otdr_name: reader.read_cstring()?,
+            otdr_sn: reader.read_cstring()?,
+            module_name: reader.read_cstring()?,
+            module_sn: reader.read_cstring()?,
+            sw_version: reader.read_cstring()?,
+            other: reader.read_cstring_opt()?,
+        })
+    }
 }
 
 /// Fixed measurement parameters.
@@ -279,6 +380,46 @@ impl KeyEvent {
             _ => "unknown",
         }
     }
+
+    pub(crate) fn read_from(reader: &mut Reader, format: u8, factor: f64) -> Result<Self> {
+        let number = reader.read_u16_le()?;
+        let prop_time = reader.read_u32_le()?;
+        let slope_raw = reader.read_i16_le()?;
+        let loss_raw = reader.read_i16_le()?;
+        let refl_raw = reader.read_i32_le()?;
+        let event_type = String::from_utf8_lossy(reader.read_bytes(8)?).into_owned();
+
+        let [
+            end_of_prev_km,
+            start_of_curr_km,
+            end_of_curr_km,
+            start_of_next_km,
+            peak_km,
+        ] = if format == 2 {
+            let mut out = [0.0f64; 5];
+            for v in &mut out {
+                *v = reader.read_u32_le()? as f64 * factor;
+            }
+            out
+        } else {
+            [0.0; 5]
+        };
+
+        Ok(Self {
+            number,
+            distance_km: prop_time as f64 * factor,
+            slope_db_per_km: slope_raw as f64 * 0.001,
+            loss_db: loss_raw as f64 * 0.001,
+            refl_db: refl_raw as f64 * 0.001,
+            event_type,
+            end_of_prev_km,
+            start_of_curr_km,
+            end_of_curr_km,
+            start_of_next_km,
+            peak_km,
+            comments: reader.read_cstring()?,
+        })
+    }
 }
 
 /// Summary characteristics of the trace.
@@ -296,6 +437,26 @@ pub struct KeyEventsSummary {
     pub orl_start_km: f64,
     /// End distance for ORL calculation, km.
     pub orl_end_km: f64,
+}
+
+impl KeyEventsSummary {
+    pub(crate) fn read_from(reader: &mut Reader, factor: f64) -> Result<KeyEventsSummary> {
+        let total_loss_db = reader.read_i32_or()? as f64 * 0.001;
+        let loss_start_km = reader.read_i32_or()? as f64 * factor;
+        let loss_end_km = reader.read_u32_or()? as f64 * factor;
+        let orl_db = reader.read_u16_or()? as f64 * 0.001;
+        let orl_start_km = reader.read_i32_or()? as f64 * factor;
+        let orl_end_km = reader.read_u32_or()? as f64 * factor;
+
+        Ok(KeyEventsSummary {
+            total_loss_db,
+            orl_db,
+            loss_start_km,
+            loss_end_km,
+            orl_start_km,
+            orl_end_km,
+        })
+    }
 }
 
 /// List of trace key events.
@@ -322,6 +483,22 @@ impl KeyEvents {
 
     pub fn end_of_fiber(&self) -> Option<&KeyEvent> {
         self.events.iter().find(|e| e.is_end_of_fiber())
+    }
+
+    pub(crate) fn read_from(
+        reader: &mut Reader,
+        format: u8,
+        fxd: Option<&FxdParams>,
+    ) -> Result<Self> {
+        let factor = fxd.map_or(1e-4 * SPEED_OF_LIGHT_KM_US / 1.4682, |fp| {
+            fp.distance_factor_km()
+        });
+        let num_events = reader.read_u16_le()? as usize;
+        let events = (0..num_events)
+            .map(|_| KeyEvent::read_from(reader, format, factor))
+            .collect::<Result<Vec<_>>>()?;
+        let summary = KeyEventsSummary::read_from(reader, factor)?;
+        Ok(Self { events, summary })
     }
 }
 
@@ -396,6 +573,28 @@ impl DataPoints {
             0.0
         }
     }
+
+    pub(crate) fn read_from(reader: &mut Reader) -> Result<Self> {
+        let num_points = reader.read_u32_le()?;
+        let num_traces = reader.read_u16_le()?;
+        let _num_points_2 = reader.read_u32_le()?;
+        let scaling_factor = reader.read_u16_le()?;
+
+        let raw_bytes = reader.read_bytes(num_points as usize * 2)?;
+        let raw_data: Vec<u16> = raw_bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+
+        Ok(Self {
+            num_points,
+            num_traces,
+            scaling_factor,
+            raw_data,
+            resolution_m: 0.0,
+            x_offset_m: 0.0,
+        })
+    }
 }
 
 /// File checksum (CRC-16).
@@ -405,6 +604,15 @@ pub struct Checksum {
     pub algorithm: u16,
     /// Calculated checksum value.
     pub value: u16,
+}
+
+impl Checksum {
+    pub(crate) fn read_from(reader: &mut Reader) -> Result<Self> {
+        Ok(Self {
+            algorithm: 1,
+            value: reader.read_u16_le()?,
+        })
+    }
 }
 
 /// Contains raw bytes.
