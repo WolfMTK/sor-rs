@@ -1,3 +1,4 @@
+mod checksum;
 mod constants;
 mod errors;
 mod models;

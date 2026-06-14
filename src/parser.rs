@@ -1,11 +1,10 @@
-use crate::constants::SPEED_OF_LIGHT_KM_US;
+use crate::checksum::crc16;
 use crate::errors::{Result, SorError};
 use crate::models::{
-    BlockInfo, Checksum, DataPoints, FxdParams, GenParams, KeyEvent, KeyEvents, KeyEventsSummary,
-    MapBlock, RawBlock, SorFile, SupParams,
+    BlockInfo, Checksum, DataPoints, FxdParams, GenParams, KeyEvents, MapBlock, RawBlock, SorFile,
+    SupParams,
 };
 use crate::reader::Reader;
-use std::collections::HashMap;
 
 impl SorFile {
     /// Parses a SOR file from disk.
@@ -20,7 +19,67 @@ impl SorFile {
     }
 }
 
-// Parses a SOR file one block at a time.
+#[derive(Default)]
+struct FxdTail {
+    averaging_time_s: f64,
+    acquisition_range_raw: u32,
+    acquisition_range_coeff: i32,
+    front_panel_offset: i32,
+    noise_floor_level: u16,
+    noise_floor_scaling: i16,
+    power_offset_first_point: u16,
+    loss_threshold_db: f64,
+    refl_threshold_db: f64,
+    eof_threshold_db: f64,
+    trace_type: String,
+    x1: i32,
+    y1: i32,
+    x2: i32,
+    y2: i32,
+}
+
+impl FxdTail {
+    fn read_v2(reader: &mut Reader) -> Result<Self> {
+        Ok(Self {
+            averaging_time_s: reader.read_u16_le()? as f64 * 0.1,
+            acquisition_range_raw: reader.read_u32_le()?,
+            acquisition_range_coeff: reader.read_i32_le()?,
+            front_panel_offset: reader.read_i32_le()?,
+            noise_floor_level: reader.read_u16_le()?,
+            noise_floor_scaling: reader.read_i16_le()?,
+            power_offset_first_point: reader.read_u16_le()?,
+            loss_threshold_db: reader.read_u16_le()? as f64 * 0.001,
+            refl_threshold_db: reader.read_u16_le()? as f64 * -0.001,
+            eof_threshold_db: reader.read_u16_le()? as f64 * 0.001,
+            trace_type: reader.read_fixed_str(2)?.replace('\0', ""),
+            x1: reader.read_i32_or()?,
+            y1: reader.read_i32_or()?,
+            x2: reader.read_i32_or()?,
+            y2: reader.read_i32_or()?,
+        })
+    }
+
+    fn read_v1(reader: &mut Reader) -> Result<Self> {
+        let tt = if reader.remaining() >= 2 {
+            reader.read_fixed_str(2)?.replace('\0', "")
+        } else {
+            "ST".to_string()
+        };
+        Ok(Self {
+            acquisition_range_raw: reader.read_u32_le()?,
+            front_panel_offset: reader.read_i32_or()?,
+            noise_floor_level: reader.read_u16_or()?,
+            noise_floor_scaling: reader.read_i16_or()?,
+            power_offset_first_point: reader.read_u16_or()?,
+            loss_threshold_db: reader.read_u16_or()? as f64 * 0.001,
+            refl_threshold_db: reader.read_u16_or()? as f64 * -0.001,
+            eof_threshold_db: reader.read_u16_or()? as f64 * 0.001,
+            trace_type: tt,
+            ..Default::default()
+        })
+    }
+}
+
 struct SorParser<'a> {
     data: &'a [u8],
     format: u8,
@@ -34,7 +93,8 @@ impl<'a> SorParser<'a> {
     fn parse(&mut self, verify_checksum: bool) -> Result<SorFile> {
         let mut sor = SorFile::default();
 
-        let map = self.parse_map()?;
+        let (map, format) = MapBlock::read_from(&mut Reader::new(self.data))?;
+        self.format = format;
         sor.map_block = Some(map.clone());
 
         let mut sorted_blocks: Vec<BlockInfo> = map.blocks.values().cloned().collect();
@@ -53,66 +113,23 @@ impl<'a> SorParser<'a> {
         Ok(sor)
     }
 
-    /// Parses the Map block (the block directory) and detects the format version (1 or 2).
-    fn parse_map(&mut self) -> Result<MapBlock> {
-        let mut reader = Reader::new(self.data);
-
-        let magic = reader.read_bytes(4)?;
-        if magic != b"Map\x00" {
-            return Err(SorError::parse(format!(
-                "Map marker not found: expected b\"Map\\0\", got {:?}",
-                magic
-            )));
-        }
-
-        let version = reader.read_u16_le()?;
-        let map_size = reader.read_u32_le()?;
-        let num_blocks_raw = reader.read_u16_le()?;
-        let data_block_count = (num_blocks_raw as usize).saturating_sub(1);
-
-        self.format = if version <= 100 { 1 } else { 2 };
-
-        let mut blocks = HashMap::new();
-        let mut running_offset = map_size as usize;
-
-        for _ in 0..data_block_count {
-            let name = reader.read_cstring()?;
-            let block_ver = reader.read_u16_le()?;
-            let block_size = reader.read_u32_le()?;
-            blocks.insert(
-                name.clone(),
-                BlockInfo {
-                    name,
-                    version: block_ver,
-                    size: block_size,
-                    offset: running_offset,
-                },
-            );
-            running_offset += block_size as usize;
-        }
-
-        Ok(MapBlock {
-            version,
-            map_size,
-            blocks,
-        })
-    }
-
-    /// Dispatches a block to its parser by name.
     fn parse_block(&self, info: &BlockInfo, sor: &mut SorFile) -> Result<()> {
+        let mut reader = self.block_reader(info)?;
         match info.name.as_str() {
-            "GenParams" => sor.gen_params = Some(self.parse_gen_params(info)?),
-            "SupParams" => sor.sup_params = Some(self.parse_sup_params(info)?),
-            "FxdParams" => sor.fxd_params = Some(self.parse_fxd_params(info)?),
+            "GenParams" => sor.gen_params = Some(GenParams::read_from(&mut reader, self.format)?),
+            "SupParams" => sor.sup_params = Some(SupParams::read_from(&mut reader)?),
+            "FxdParams" => sor.fxd_params = Some(self.parse_fxd_params(&mut reader)?),
             "KeyEvents" => {
-                sor.key_events = Some(self.parse_key_events(info, sor.fxd_params.as_ref())?)
+                sor.key_events = Some(KeyEvents::read_from(
+                    &mut reader,
+                    self.format,
+                    sor.fxd_params.as_ref(),
+                )?)
             }
-            "DataPts" => sor.data_points = Some(self.parse_data_pts(info)?),
-            "Cksum" => sor.checksum = Some(self.parse_cksum(info)?),
+            "DataPts" => sor.data_points = Some(DataPoints::read_from(&mut reader)?),
+            "Cksum" => sor.checksum = Some(Checksum::read_from(&mut reader)?),
             _ => {
-                let mut r = self.block_reader(info)?;
-                let remaining = r.remaining();
-                let data = r.read_bytes(remaining)?.to_vec();
+                let data = reader.read_bytes(reader.remaining())?.to_vec();
                 sor.raw_blocks.insert(
                     info.name.clone(),
                     RawBlock {
@@ -125,74 +142,16 @@ impl<'a> SorParser<'a> {
         Ok(())
     }
 
-    /// A reader positioned at the block payload, just past the name string.
     fn block_reader(&self, info: &BlockInfo) -> Result<Reader<'a>> {
         let name_size = info.name.len() + 1;
-        let content_offset = info.offset + name_size;
-        let content_size = (info.size as usize).saturating_sub(name_size);
-        Reader::new(self.data).slice(content_offset, content_size)
+        Reader::with_bounds(
+            self.data,
+            info.offset + name_size,
+            (info.size as usize).saturating_sub(name_size),
+        )
     }
 
-    /// Parses GenParams (general measurement parameters).
-    fn parse_gen_params(&self, info: &BlockInfo) -> Result<GenParams> {
-        let mut reader = self.block_reader(info)?;
-
-        let language = reader.read_fixed_str(2)?;
-        let cable_id = reader.read_cstring()?;
-        let fiber_id = reader.read_cstring()?;
-        let fiber_type_code = reader.read_u16_le()?;
-        let wavelength_nm = reader.read_u16_le()? as f64 * 0.1;
-        let location_a = reader.read_cstring()?;
-        let cable_code = reader.read_cstring()?;
-        let build_condition = reader.read_cstring()?;
-        let user_offset_raw = reader.read_i32_le()?;
-
-        let (location_b, user_offset_distance, operator, comments) = if self.format == 2 {
-            let location_b = reader.read_cstring()?;
-            let user_offset_distance = reader.read_i32_le()?;
-            let operator = reader.read_cstring()?;
-            let comments = read_cstring_opt(&mut reader);
-            (location_b, user_offset_distance, operator, comments)
-        } else {
-            let operator = read_cstring_opt(&mut reader);
-            (String::new(), 0, operator, String::new())
-        };
-
-        Ok(GenParams {
-            language,
-            cable_id,
-            fiber_id,
-            fiber_type_code,
-            wavelength_nm,
-            location_a,
-            location_b,
-            cable_code,
-            build_condition,
-            user_offset_raw,
-            user_offset_distance,
-            operator,
-            comments,
-        })
-    }
-
-    /// Parses SupParams (supplier and instrument info).
-    fn parse_sup_params(&self, info: &BlockInfo) -> Result<SupParams> {
-        let mut reader = self.block_reader(info)?;
-        Ok(SupParams {
-            supplier: reader.read_cstring()?,
-            otdr_name: reader.read_cstring()?,
-            otdr_sn: reader.read_cstring()?,
-            module_name: reader.read_cstring()?,
-            module_sn: reader.read_cstring()?,
-            sw_version: reader.read_cstring()?,
-            other: read_cstring_opt(&mut reader),
-        })
-    }
-
-    /// Parses FxdParams (fixed acquisition parameters).
-    fn parse_fxd_params(&self, info: &BlockInfo) -> Result<FxdParams> {
-        let mut reader = self.block_reader(info)?;
-
+    fn parse_fxd_params(&self, reader: &mut Reader) -> Result<FxdParams> {
         let timestamp = reader.read_u32_le()?;
         let unit = reader.read_fixed_str(2)?;
         let wavelength_nm = reader.read_u16_le()? as f64 * 0.1;
@@ -205,10 +164,9 @@ impl<'a> SorParser<'a> {
         };
 
         let num_pw = reader.read_u16_le()? as usize;
-        let mut pulse_widths_ns = Vec::with_capacity(num_pw);
-        for _ in 0..num_pw {
-            pulse_widths_ns.push(reader.read_u16_le()?);
-        }
+        let pulse_widths_ns = (0..num_pw)
+            .map(|_| reader.read_u16_le())
+            .collect::<Result<Vec<_>>>()?;
 
         let sample_spacing_raw = reader.read_u32_le()?;
         let num_data_points = reader.read_u32_le()?;
@@ -216,68 +174,10 @@ impl<'a> SorParser<'a> {
         let backscatter_coeff_db = reader.read_u16_le()? as f64 * -0.1;
         let num_averages = reader.read_u32_le()?;
 
-        let (
-            averaging_time_s,
-            acquisition_range_raw,
-            acquisition_range_coeff,
-            front_panel_offset,
-            noise_floor_level,
-            noise_floor_scaling,
-            power_offset_first_point,
-            loss_threshold_db,
-            refl_threshold_db,
-            eof_threshold_db,
-            trace_type,
-            x1,
-            y1,
-            x2,
-            y2,
-        ) = if self.format == 2 {
-            let avg_time = reader.read_u16_le()? as f64 * 0.1;
-            let acq_range = reader.read_u32_le()?;
-            let acq_coeff = reader.read_i32_le()?;
-            let fpo = reader.read_i32_le()?;
-            let nfl = reader.read_u16_le()?;
-            let nfs = reader.read_i16_le()?;
-            let pofp = reader.read_u16_le()?;
-            let loss_thr = reader.read_u16_le()? as f64 * 0.001;
-            let refl_thr = reader.read_u16_le()? as f64 * -0.001;
-            let eof_thr = reader.read_u16_le()? as f64 * 0.001;
-            let tt = reader.read_fixed_str(2)?.replace('\0', "");
-            (
-                avg_time,
-                acq_range,
-                acq_coeff,
-                fpo,
-                nfl,
-                nfs,
-                pofp,
-                loss_thr,
-                refl_thr,
-                eof_thr,
-                tt,
-                read_i32_or(&mut reader, 0)?,
-                read_i32_or(&mut reader, 0)?,
-                read_i32_or(&mut reader, 0)?,
-                read_i32_or(&mut reader, 0)?,
-            )
+        let tail = if self.format == 2 {
+            FxdTail::read_v2(reader)?
         } else {
-            let acq_range = reader.read_u32_le()?;
-            let fpo = read_i32_or(&mut reader, 0)?;
-            let nfl = read_u16_or(&mut reader, 0)?;
-            let nfs = read_i16_or(&mut reader, 0)?;
-            let pofp = read_u16_or(&mut reader, 0)?;
-            let loss_thr = read_u16_or(&mut reader, 0)? as f64 * 0.001;
-            let refl_thr = read_u16_or(&mut reader, 0)? as f64 * -0.001;
-            let eof_thr = read_u16_or(&mut reader, 0)? as f64 * 0.001;
-            let tt = if reader.remaining() >= 2 {
-                reader.read_fixed_str(2)?.replace('\0', "")
-            } else {
-                "ST".to_string()
-            };
-            (
-                0.0, acq_range, 0, fpo, nfl, nfs, pofp, loss_thr, refl_thr, eof_thr, tt, 0, 0, 0, 0,
-            )
+            FxdTail::read_v1(reader)?
         };
 
         Ok(FxdParams {
@@ -292,142 +192,35 @@ impl<'a> SorParser<'a> {
             group_index,
             backscatter_coeff_db,
             num_averages,
-            averaging_time_s,
-            acquisition_range_raw,
-            acquisition_range_coeff,
-            front_panel_offset,
-            noise_floor_level,
-            noise_floor_scaling,
-            power_offset_first_point,
-            loss_threshold_db,
-            refl_threshold_db,
-            eof_threshold_db,
-            trace_type,
-            x1,
-            y1,
-            x2,
-            y2,
+            averaging_time_s: tail.averaging_time_s,
+            acquisition_range_raw: tail.acquisition_range_raw,
+            acquisition_range_coeff: tail.acquisition_range_coeff,
+            front_panel_offset: tail.front_panel_offset,
+            noise_floor_level: tail.noise_floor_level,
+            noise_floor_scaling: tail.noise_floor_scaling,
+            power_offset_first_point: tail.power_offset_first_point,
+            loss_threshold_db: tail.loss_threshold_db,
+            refl_threshold_db: tail.refl_threshold_db,
+            eof_threshold_db: tail.eof_threshold_db,
+            trace_type: tail.trace_type,
+            x1: tail.x1,
+            y1: tail.y1,
+            x2: tail.x2,
+            y2: tail.y2,
         })
     }
 
-    /// Parses KeyEvents (detected trace events).
-    fn parse_key_events(&self, info: &BlockInfo, fxd: Option<&FxdParams>) -> Result<KeyEvents> {
-        let mut reader = self.block_reader(info)?;
-
-        let factor = match fxd {
-            Some(fp) => fp.distance_factor_km(),
-            None => 1e-4 * SPEED_OF_LIGHT_KM_US / 1.4682,
-        };
-
-        let num_events = reader.read_u16_le()? as usize;
-        let mut events = Vec::with_capacity(num_events);
-
-        for _ in 0..num_events {
-            let ev_num = reader.read_u16_le()?;
-            let prop_time = reader.read_u32_le()?;
-            let slope_raw = reader.read_i16_le()?;
-            let loss_raw = reader.read_i16_le()?;
-            let refl_raw = reader.read_i32_le()?;
-            let event_type = String::from_utf8_lossy(reader.read_bytes(8)?).into_owned();
-
-            let distance_km = prop_time as f64 * factor;
-
-            let (end_prev, start_curr, end_curr, start_next, peak) = if self.format == 2 {
-                (
-                    reader.read_u32_le()? as f64 * factor,
-                    reader.read_u32_le()? as f64 * factor,
-                    reader.read_u32_le()? as f64 * factor,
-                    reader.read_u32_le()? as f64 * factor,
-                    reader.read_u32_le()? as f64 * factor,
-                )
-            } else {
-                (0.0, 0.0, 0.0, 0.0, 0.0)
-            };
-
-            let comments = reader.read_cstring()?;
-
-            events.push(KeyEvent {
-                number: ev_num,
-                distance_km,
-                slope_db_per_km: slope_raw as f64 * 0.001,
-                loss_db: loss_raw as f64 * 0.001,
-                refl_db: refl_raw as f64 * 0.001,
-                event_type,
-                end_of_prev_km: end_prev,
-                start_of_curr_km: start_curr,
-                end_of_curr_km: end_curr,
-                start_of_next_km: start_next,
-                peak_km: peak,
-                comments,
-            });
+    fn read_event_span(&self, reader: &mut Reader, factor: f64) -> Result<[f64; 5]> {
+        if self.format != 2 {
+            return Ok([0.0; 5]);
         }
-
-        let mut summary = KeyEventsSummary {
-            total_loss_db: 0.0,
-            orl_db: 0.0,
-            loss_start_km: 0.0,
-            loss_end_km: 0.0,
-            orl_start_km: 0.0,
-            orl_end_km: 0.0,
-        };
-
-        if reader.remaining() >= 4 {
-            summary.total_loss_db = reader.read_i32_le()? as f64 * 0.001;
+        let mut out = [0.0f64; 5];
+        for v in &mut out {
+            *v = reader.read_u32_le()? as f64 * factor;
         }
-        if reader.remaining() >= 4 {
-            summary.loss_start_km = reader.read_i32_le()? as f64 * factor;
-        }
-        if reader.remaining() >= 4 {
-            summary.loss_end_km = reader.read_u32_le()? as f64 * factor;
-        }
-        if reader.remaining() >= 2 {
-            summary.orl_db = reader.read_u16_le()? as f64 * 0.001;
-        }
-        if reader.remaining() >= 4 {
-            summary.orl_start_km = reader.read_i32_le()? as f64 * factor;
-        }
-        if reader.remaining() >= 4 {
-            summary.orl_end_km = reader.read_u32_le()? as f64 * factor;
-        }
-
-        Ok(KeyEvents { events, summary })
+        Ok(out)
     }
 
-    /// Parses DataPts (raw OTDR trace samples).
-    fn parse_data_pts(&self, info: &BlockInfo) -> Result<DataPoints> {
-        let mut reader = self.block_reader(info)?;
-
-        let num_points = reader.read_u32_le()?;
-        let num_traces = reader.read_u16_le()?;
-        let _num_points_2 = reader.read_u32_le()?;
-        let scaling_factor = reader.read_u16_le()?;
-
-        let raw_bytes = reader.read_bytes(num_points as usize * 2)?;
-        let mut raw_data = Vec::with_capacity(num_points as usize);
-        for chunk in raw_bytes.chunks_exact(2) {
-            raw_data.push(u16::from_le_bytes([chunk[0], chunk[1]]));
-        }
-
-        Ok(DataPoints {
-            num_points,
-            num_traces,
-            scaling_factor,
-            raw_data,
-            resolution_m: 0.0,
-            x_offset_m: 0.0,
-        })
-    }
-
-    /// Parses the Cksum block.
-    fn parse_cksum(&self, info: &BlockInfo) -> Result<Checksum> {
-        let mut r = self.block_reader(info)?;
-        Ok(Checksum {
-            algorithm: 1,
-            value: r.read_u16_le()?,
-        })
-    }
-
-    /// Verifies the file's CRC-16/CCITT-FALSE checksum.
     fn verify_checksum(&self, sor: &SorFile) -> Result<()> {
         let cksum_info = sor.map_block.as_ref().and_then(|m| m.blocks.get("Cksum"));
 
@@ -446,7 +239,6 @@ impl<'a> SorParser<'a> {
         Ok(())
     }
 
-    /// Copies resolution and x-offset from FxdParams into DataPoints.
     fn link_data_points(&self, sor: &mut SorFile) {
         if let (Some(dp), Some(fp)) = (&mut sor.data_points, &sor.fxd_params) {
             dp.resolution_m = fp.resolution_m();
@@ -455,59 +247,10 @@ impl<'a> SorParser<'a> {
     }
 }
 
-/// Reads a C-string, or returns an empty one if no bytes are left.
-fn read_cstring_opt(reader: &mut Reader<'_>) -> String {
-    if reader.remaining() > 0 {
-        return reader.read_cstring().unwrap_or_default();
-    }
-    String::new()
-}
-
-/// Reads an i32, or `default` if fewer than 4 bytes remain.
-fn read_i32_or(reader: &mut Reader<'_>, default: i32) -> Result<i32> {
-    if reader.remaining() >= 4 {
-        return reader.read_i32_le();
-    }
-    Ok(default)
-}
-
-/// Reads a u16, or `default` if fewer than 2 bytes remain.
-fn read_u16_or(reader: &mut Reader<'_>, default: u16) -> Result<u16> {
-    if reader.remaining() >= 2 {
-        return reader.read_u16_le();
-    }
-    Ok(default)
-}
-
-/// Reads an i16, or `default` if fewer than 2 bytes remain.
-fn read_i16_or(reader: &mut Reader<'_>, default: i16) -> Result<i16> {
-    if reader.remaining() >= 2 {
-        return reader.read_i16_le();
-    }
-    Ok(default)
-}
-
-/// CRC-16/CCITT-FALSE digest of `data`.
-pub fn crc16(data: &[u8]) -> u16 {
-    let mut crc: u16 = 0xFFFF;
-    for &byte in data {
-        crc ^= (byte as u16) << 8;
-        for _ in 0..8 {
-            if crc & 0x8000 != 0 {
-                crc = (crc << 1) ^ 0x1021;
-            } else {
-                crc <<= 1;
-            }
-        }
-    }
-    crc
-}
-
 #[cfg(test)]
 mod tests {
     use crate::errors::SorError;
     use crate::models::SorFile;
-    use crate::parser::crc16;
     use rstest::{fixture, rstest};
 
     fn sample(name: &str) -> String {
@@ -515,29 +258,58 @@ mod tests {
     }
 
     #[fixture]
-    fn noyes() -> String { sample("example1-noyes-ofl280.sor") }
+    fn noyes() -> String {
+        sample("example1-noyes-ofl280.sor")
+    }
 
     #[fixture]
-    fn noyes_fast() -> String { sample("example1-noyes-ofl280-fastreporter-save.sor") }
+    fn noyes_fast() -> String {
+        sample("example1-noyes-ofl280-fastreporter-save.sor")
+    }
 
     #[fixture]
-    fn exfo_max() -> String { sample("example2-exfo-maxtester730c.sor") }
+    fn exfo_max() -> String {
+        sample("example2-exfo-maxtester730c.sor")
+    }
 
     #[fixture]
-    fn anritsu() -> String { sample("example3-anritsu-accessmastermt9085.sor") }
+    fn anritsu() -> String {
+        sample("example3-anritsu-accessmastermt9085.sor")
+    }
 
     #[fixture]
-    fn exfo_1310() -> String { sample("example4-exfo-ftb4ftbx730c-mfdgainer-1310nm.sor") }
+    fn exfo_1310() -> String {
+        sample("example4-exfo-ftb4ftbx730c-mfdgainer-1310nm.sor")
+    }
 
     #[fixture]
-    fn exfo_1550() -> String { sample("example4-exfo-ftb4ftbx730c-mfdgainer-1550nm.sor") }
+    fn exfo_1550() -> String {
+        sample("example4-exfo-ftb4ftbx730c-mfdgainer-1550nm.sor")
+    }
 
     #[fixture]
-    fn exfo_rtu() -> String { sample("example5-exfo-rtu2ftbx735c-sm7r-ea-hrd.sor") }
+    fn exfo_rtu() -> String {
+        sample("example5-exfo-rtu2ftbx735c-sm7r-ea-hrd.sor")
+    }
 
     #[fixture]
     fn sor_file(#[from(noyes)] path: String) -> SorFile {
         SorFile::from_file(&path, false).unwrap()
+    }
+
+    #[fixture]
+    fn all_files(
+        noyes: String,
+        noyes_fast: String,
+        exfo_max: String,
+        anritsu: String,
+        exfo_1310: String,
+        exfo_1550: String,
+        exfo_rtu: String,
+    ) -> Vec<String> {
+        vec![
+            noyes, noyes_fast, exfo_max, anritsu, exfo_1310, exfo_1550, exfo_rtu,
+        ]
     }
 
     #[rstest]
@@ -547,7 +319,10 @@ mod tests {
             .chain(b"\x00".iter().cycle().take(100))
             .copied()
             .collect::<Vec<_>>();
-        assert!(matches!(SorFile::from_bytes(&bad, false), Err(SorError::ParseError(_))));
+        assert!(matches!(
+            SorFile::from_bytes(&bad, false),
+            Err(SorError::ParseError(_))
+        ));
     }
 
     #[rstest]
@@ -557,32 +332,16 @@ mod tests {
     }
 
     #[rstest]
-    fn parse_without_error(
-        noyes: String,
-        noyes_fast: String,
-        exfo_max: String,
-        anritsu: String,
-        exfo_1310: String,
-        exfo_1550: String,
-        exfo_rtu: String,
-    ) {
-        for path in &[noyes, noyes_fast, exfo_max, anritsu, exfo_1310, exfo_1550, exfo_rtu] {
+    fn parse_without_error(all_files: Vec<String>) {
+        for path in &all_files {
             SorFile::from_file(path, false)
                 .unwrap_or_else(|e| panic!("Failed to parse {path}: {e}"));
         }
     }
 
     #[rstest]
-    fn from_bytes(
-        noyes: String,
-        noyes_fast: String,
-        exfo_max: String,
-        anritsu: String,
-        exfo_1310: String,
-        exfo_1550: String,
-        exfo_rtu: String,
-    ) {
-        for path in &[noyes, noyes_fast, exfo_max, anritsu, exfo_1310, exfo_1550, exfo_rtu] {
+    fn from_bytes(all_files: Vec<String>) {
+        for path in &all_files {
             let data = std::fs::read(path).unwrap();
             SorFile::from_bytes(&data, false)
                 .unwrap_or_else(|e| panic!("Failed from_bytes {path}: {e}"));
@@ -599,7 +358,14 @@ mod tests {
     #[rstest]
     fn map_block_required_keys(sor_file: SorFile) {
         let map = sor_file.map_block.as_ref().unwrap();
-        for key in &["GenParams", "SupParams", "FxdParams", "KeyEvents", "DataPts", "Cksum"] {
+        for key in &[
+            "GenParams",
+            "SupParams",
+            "FxdParams",
+            "KeyEvents",
+            "DataPts",
+            "Cksum",
+        ] {
             assert!(map.blocks.contains_key(*key), "Missing block: {key}");
         }
     }
@@ -622,16 +388,8 @@ mod tests {
     }
 
     #[rstest]
-    fn map_all_files(
-        noyes: String,
-        noyes_fast: String,
-        exfo_max: String,
-        anritsu: String,
-        exfo_1310: String,
-        exfo_1550: String,
-        exfo_rtu: String,
-    ) {
-        for path in &[noyes, noyes_fast, exfo_max, anritsu, exfo_1310, exfo_1550, exfo_rtu] {
+    fn map_all_files(all_files: Vec<String>) {
+        for path in &all_files {
             let sor = SorFile::from_file(path, false).unwrap();
             assert!(sor.map_block.as_ref().unwrap().num_blocks() > 0);
         }
@@ -657,16 +415,8 @@ mod tests {
     }
 
     #[rstest]
-    fn gen_params_all_files(
-        noyes: String,
-        noyes_fast: String,
-        exfo_max: String,
-        anritsu: String,
-        exfo_1310: String,
-        exfo_1550: String,
-        exfo_rtu: String,
-    ) {
-        for path in &[noyes, noyes_fast, exfo_max, anritsu, exfo_1310, exfo_1550, exfo_rtu] {
+    fn gen_params_all_files(all_files: Vec<String>) {
+        for path in &all_files {
             let sor = SorFile::from_file(path, false).unwrap();
             let gp = sor.gen_params.as_ref().expect("GenParams missing");
             assert_eq!(gp.language.len(), 2, "Invalid language in {path}");
@@ -690,16 +440,8 @@ mod tests {
     }
 
     #[rstest]
-    fn sup_params_all_files(
-        noyes: String,
-        noyes_fast: String,
-        exfo_max: String,
-        anritsu: String,
-        exfo_1310: String,
-        exfo_1550: String,
-        exfo_rtu: String,
-    ) {
-        for path in &[noyes, noyes_fast, exfo_max, anritsu, exfo_1310, exfo_1550, exfo_rtu] {
+    fn sup_params_all_files(all_files: Vec<String>) {
+        for path in &all_files {
             let sor = SorFile::from_file(path, false).unwrap();
             assert!(sor.sup_params.is_some(), "SupParams missing in {path}");
         }
@@ -714,7 +456,11 @@ mod tests {
 
         assert_eq!(fp.unit, "mt");
 
-        assert!((1.4..=1.6).contains(&fp.group_index), "n = {}", fp.group_index);
+        assert!(
+            (1.4..=1.6).contains(&fp.group_index),
+            "n = {}",
+            fp.group_index
+        );
 
         assert_eq!(fp.num_data_points, 30000);
 
@@ -729,34 +475,21 @@ mod tests {
     }
 
     #[rstest]
-    fn fxd_params_resolution_realistic(
-        noyes: String,
-        noyes_fast: String,
-        exfo_max: String,
-        anritsu: String,
-        exfo_1310: String,
-        exfo_1550: String,
-        exfo_rtu: String,
-    ) {
-        for path in &[noyes, noyes_fast, exfo_max, anritsu, exfo_1310, exfo_1550, exfo_rtu] {
+    fn fxd_params_resolution_realistic(all_files: Vec<String>) {
+        for path in &all_files {
             let sor = SorFile::from_file(path, false).unwrap();
             let fp = sor.fxd_params.as_ref().unwrap();
             let r = fp.resolution_m();
-            assert!(r > 0.0 && r < 100.0, "Unrealistic resolution {r:.4} in {path}");
+            assert!(
+                r > 0.0 && r < 100.0,
+                "Unrealistic resolution {r:.4} in {path}"
+            );
         }
     }
 
     #[rstest]
-    fn fxd_params_group_index_realistic(
-        noyes: String,
-        noyes_fast: String,
-        exfo_max: String,
-        anritsu: String,
-        exfo_1310: String,
-        exfo_1550: String,
-        exfo_rtu: String,
-    ) {
-        for path in &[noyes, noyes_fast, exfo_max, anritsu, exfo_1310, exfo_1550, exfo_rtu] {
+    fn fxd_params_group_index_realistic(all_files: Vec<String>) {
+        for path in &all_files {
             let sor = SorFile::from_file(path, false).unwrap();
             let n = sor.fxd_params.as_ref().unwrap().group_index;
             assert!((1.4..=1.6).contains(&n), "n={n} in {path}");
@@ -792,21 +525,18 @@ mod tests {
     fn key_events_type_length(sor_file: SorFile) {
         let ke = sor_file.key_events.as_ref().unwrap();
         for ev in &ke.events {
-            assert_eq!(ev.event_type.len(), 8, "Event type length: {:?}", ev.event_type);
+            assert_eq!(
+                ev.event_type.len(),
+                8,
+                "Event type length: {:?}",
+                ev.event_type
+            );
         }
     }
 
     #[rstest]
-    fn key_events_distances_non_negative(
-        noyes: String,
-        noyes_fast: String,
-        exfo_max: String,
-        anritsu: String,
-        exfo_1310: String,
-        exfo_1550: String,
-        exfo_rtu: String,
-    ) {
-        for path in &[noyes, noyes_fast, exfo_max, anritsu, exfo_1310, exfo_1550, exfo_rtu] {
+    fn key_events_distances_non_negative(all_files: Vec<String>) {
+        for path in &all_files {
             let sor = SorFile::from_file(path, false).unwrap();
             let ke = sor.key_events.as_ref().unwrap();
             for ev in &ke.events {
@@ -822,21 +552,21 @@ mod tests {
         let ev2 = &ke.events[1];
         let ev3 = &ke.events[2];
         assert!((ev1.distance_km - 0.0).abs() < 0.001);
-        assert!((ev2.distance_km - 0.011).abs() < 0.001, "ev2 dist = {:.4}", ev2.distance_km);
-        assert!((ev3.distance_km - 3.734).abs() < 0.01, "ev3 dist = {:.4}", ev3.distance_km);
+        assert!(
+            (ev2.distance_km - 0.011).abs() < 0.001,
+            "ev2 dist = {:.4}",
+            ev2.distance_km
+        );
+        assert!(
+            (ev3.distance_km - 3.734).abs() < 0.01,
+            "ev3 dist = {:.4}",
+            ev3.distance_km
+        );
     }
 
     #[rstest]
-    fn key_events_summary_orl_realistic(
-        noyes: String,
-        noyes_fast: String,
-        exfo_max: String,
-        anritsu: String,
-        exfo_1310: String,
-        exfo_1550: String,
-        exfo_rtu: String,
-    ) {
-        for path in &[noyes, noyes_fast, exfo_max, anritsu, exfo_1310, exfo_1550, exfo_rtu] {
+    fn key_events_summary_orl_realistic(all_files: Vec<String>) {
+        for path in &all_files {
             let sor = SorFile::from_file(path, false).unwrap();
             let orl = sor.key_events.as_ref().unwrap().summary.orl_db;
             assert!((-100.0..=100.0).contains(&orl), "ORL={orl} in {path}");
@@ -846,7 +576,11 @@ mod tests {
     #[rstest]
     fn key_events_noyes_summary(sor_file: SorFile) {
         let s = &sor_file.key_events.as_ref().unwrap().summary;
-        assert!((s.total_loss_db - 0.576).abs() < 0.01, "total_loss={}", s.total_loss_db);
+        assert!(
+            (s.total_loss_db - 0.576).abs() < 0.01,
+            "total_loss={}",
+            s.total_loss_db
+        );
         assert!((s.orl_db - 24.516).abs() < 0.01, "orl={}", s.orl_db);
     }
 
@@ -858,16 +592,8 @@ mod tests {
     }
 
     #[rstest]
-    fn key_events_all_files_positive_count(
-        noyes: String,
-        noyes_fast: String,
-        exfo_max: String,
-        anritsu: String,
-        exfo_1310: String,
-        exfo_1550: String,
-        exfo_rtu: String,
-    ) {
-        for path in &[noyes, noyes_fast, exfo_max, anritsu, exfo_1310, exfo_1550, exfo_rtu] {
+    fn key_events_all_files_positive_count(all_files: Vec<String>) {
+        for path in &all_files {
             let sor = SorFile::from_file(path, false).unwrap();
             assert!(sor.key_events.as_ref().unwrap().num_events() > 0, "{path}");
         }
@@ -900,7 +626,12 @@ mod tests {
         let dp = sor_file.data_points.as_ref().unwrap();
         let dists = dp.distances_km();
         for w in dists.windows(2) {
-            assert!(w[1] >= w[0], "Distances are not monotonic: {} >= {}", w[0], w[1]);
+            assert!(
+                w[1] >= w[0],
+                "Distances are not monotonic: {} >= {}",
+                w[0],
+                w[1]
+            );
         }
     }
 
@@ -928,20 +659,15 @@ mod tests {
     fn data_points_start_near_zero(sor_file: SorFile) {
         let dp = sor_file.data_points.as_ref().unwrap();
         let first = dp.distances_km()[0];
-        assert!(first.abs() < 1.0, "First distance is too far from 0: {first}");
+        assert!(
+            first.abs() < 1.0,
+            "First distance is too far from 0: {first}"
+        );
     }
 
     #[rstest]
-    fn data_points_all_files(
-        noyes: String,
-        noyes_fast: String,
-        exfo_max: String,
-        anritsu: String,
-        exfo_1310: String,
-        exfo_1550: String,
-        exfo_rtu: String,
-    ) {
-        for path in &[noyes, noyes_fast, exfo_max, anritsu, exfo_1310, exfo_1550, exfo_rtu] {
+    fn data_points_all_files(all_files: Vec<String>) {
+        for path in &all_files {
             let sor = SorFile::from_file(path, false).unwrap();
             let dp = sor.data_points.as_ref().expect("DataPts missing");
             assert!(dp.num_points > 0);
@@ -973,14 +699,23 @@ mod tests {
     #[rstest]
     fn raw_blocks_exfo(exfo_max: String) {
         let sor = SorFile::from_file(exfo_max, false).unwrap();
-        let has_exfo = sor.raw_blocks.keys().any(|k| k.contains("Exfo") || k.contains("exfo"));
-        assert!(has_exfo || !sor.raw_blocks.is_empty(), "Expected EXFO proprietary blocks");
+        let has_exfo = sor
+            .raw_blocks
+            .keys()
+            .any(|k| k.contains("Exfo") || k.contains("exfo"));
+        assert!(
+            has_exfo || !sor.raw_blocks.is_empty(),
+            "Expected EXFO proprietary blocks"
+        );
     }
 
     #[rstest]
     fn raw_blocks_anritsu(anritsu: String) {
         let sor = SorFile::from_file(anritsu, false).unwrap();
-        assert!(!sor.raw_blocks.is_empty(), "Expected Anritsu proprietary blocks");
+        assert!(
+            !sor.raw_blocks.is_empty(),
+            "Expected Anritsu proprietary blocks"
+        );
         for (_, rb) in &sor.raw_blocks {
             assert_eq!(rb.size(), rb.data.len());
         }
@@ -1004,17 +739,6 @@ mod tests {
         let n1 = sor1.fxd_params.as_ref().unwrap().group_index;
         let n2 = sor2.fxd_params.as_ref().unwrap().group_index;
         assert!((n1 - n2).abs() < 0.01, "n1={n1} vs n2={n2}");
-    }
-
-    #[rstest]
-    fn crc16_known_value() {
-        let val = crc16(b"123456789");
-        assert_eq!(val, 0x29B1, "CRC-16/CCITT-FALSE: expected 0x29B1, got {val:#06x}");
-    }
-
-    #[rstest]
-    fn crc16_empty() {
-        assert_eq!(crc16(b""), 0xFFFF);
     }
 
     #[rstest]
