@@ -1,5 +1,14 @@
-use crate::constants::ZERO;
 use crate::errors::{Result, SorError};
+
+macro_rules! read_or {
+    ($self:expr, $method:ident, $n:literal) => {
+        if $self.remaining() >= $n {
+            $self.$method()
+        } else {
+            Ok(Default::default())
+        }
+    };
+}
 
 /// Sequential binary data reader with bounded buffer limits.
 pub struct Reader<'a> {
@@ -14,25 +23,26 @@ impl<'a> Reader<'a> {
         let end = data.len();
         Self {
             data,
-            position: ZERO,
+            position: 0,
             end,
         }
     }
 
     /// Creates a sub-reader covering `data[offset..offset + size]`.
-    pub fn slice(&self, offset: usize, size: usize) -> Result<Reader<'a>> {
+    pub fn with_bounds(data: &'a [u8], offset: usize, size: usize) -> Result<Self> {
         let end = offset + size;
-        if end > self.data.len() {
+        if end > data.len() {
             return Err(SorError::parse(format!(
                 "Slice [{offset:#x}..{end:#x}] is out of bounds (data size {:#x})",
-                self.data.len()
+                data.len()
             )));
         }
-        Ok(Reader {
-            data: self.data,
-            position: offset,
-            end,
-        })
+        Ok(Self { data, position: offset, end })
+    }
+
+    /// Creates a sub-reader covering `data[offset..offset + size]`.
+    pub fn slice(&self, offset: usize, size: usize) -> Result<Reader<'a>> {
+        Reader::with_bounds(self.data, offset, size)
     }
 
     /// Returns the current absolute position within the underlying buffer.
@@ -79,32 +89,27 @@ impl<'a> Reader<'a> {
 
     /// Reads one byte.
     pub fn read_u8(&mut self) -> Result<u8> {
-        let bytes = self.read_bytes(1)?;
-        Ok(bytes[0])
+        Ok(u8::from_le_bytes(self.read_array()?))
     }
 
     /// Reads a little-endian `u16`.
     pub fn read_u16_le(&mut self) -> Result<u16> {
-        let bytes = self.read_bytes(2)?;
-        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+        Ok(u16::from_le_bytes(self.read_array()?))
     }
 
     /// Reads a little-endian `u32`.
     pub fn read_u32_le(&mut self) -> Result<u32> {
-        let bytes = self.read_bytes(4)?;
-        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        Ok(u32::from_le_bytes(self.read_array()?))
     }
 
     /// Reads a little-endian `i16`.
     pub fn read_i16_le(&mut self) -> Result<i16> {
-        let bytes = self.read_bytes(2)?;
-        Ok(i16::from_le_bytes([bytes[0], bytes[1]]))
+        Ok(i16::from_le_bytes(self.read_array()?))
     }
 
     /// Reads a little-endian `i32`.
     pub fn read_i32_le(&mut self) -> Result<i32> {
-        let bytes = self.read_bytes(4)?;
-        Ok(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        Ok(i32::from_le_bytes(self.read_array()?))
     }
 
     /// Reads `n` bytes and lossily decodes them as ASCII, stripping control
@@ -134,6 +139,40 @@ impl<'a> Reader<'a> {
             .to_string();
         self.position = start + null_position + 1;
         Ok(string)
+    }
+
+    /// Reads a C-string if data is available, otherwise returns an empty string.
+    pub fn read_cstring_opt(&mut self) -> Result<String> {
+        if self.remaining() > 0 {
+            return self.read_cstring();
+        }
+        Ok(String::new())
+    }
+
+    /// Reads an i32 if 4 bytes are available, otherwise returns 0.
+    pub fn read_i32_or(&mut self) -> Result<i32> {
+        read_or!(self, read_i32_le, 4)
+    }
+
+    /// Reads an u16 if 2 bytes are available, otherwise returns 0.
+    pub fn read_u16_or(&mut self) -> Result<u16> {
+        read_or!(self, read_u16_le, 2)
+    }
+
+    /// Reads an u32 if 4 bytes are available, otherwise returns 0.
+    pub fn read_u32_or(&mut self) -> Result<u32> {
+        read_or!(self, read_u32_le, 4)
+    }
+
+    /// Reads an i16 if 2 bytes are available, otherwise returns 0.
+    pub fn read_i16_or(&mut self) -> Result<i16> {
+        read_or!(self, read_i16_le, 2)
+    }
+
+    fn read_array<const N: usize>(&mut self) -> Result<[u8; N]> {
+        self.read_bytes(N)?
+            .try_into()
+            .map_err(|_| SorError::parse("array conversion failed"))
     }
 }
 
