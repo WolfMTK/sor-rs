@@ -16,16 +16,14 @@ pub(crate) fn crc16(data: &[u8]) -> u16 {
 
 #[cfg(test)]
 mod test {
-    use crate::checksum::crc16;
     use rstest::rstest;
+
+    use crate::checksum::crc16;
 
     #[rstest]
     fn crc16_known_value() {
         let val = crc16(b"123456789");
-        assert_eq!(
-            val, 0x29B1,
-            "CRC-16/CCITT-FALSE: expected 0x29B1, got {val:#06x}"
-        );
+        assert_eq!(val, 0x29B1, "CRC-16/CCITT-FALSE: expected 0x29B1, got {val:#06x}");
     }
 
     #[rstest]
