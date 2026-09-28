@@ -1,8 +1,9 @@
+use std::collections::HashMap;
+
 use crate::SorError;
 use crate::constants::SPEED_OF_LIGHT_KM_US;
 use crate::errors::Result;
 use crate::reader::Reader;
-use std::collections::HashMap;
 
 /// Description of a single block from the Map table.
 #[derive(Debug, Clone)]
@@ -99,7 +100,7 @@ pub struct GenParams {
     pub fiber_id: String,
     /// Numeric fiber type code.
     pub fiber_type_code: u16,
-    /// Wavelength, nm (raw * 0.1).
+    /// Nominal wavelength, nm.
     pub wavelength_nm: f64,
     /// Location A (near end).
     pub location_a: String,
@@ -137,24 +138,25 @@ impl GenParams {
         let language = reader.read_fixed_str(2)?;
         let cable_id = reader.read_cstring()?;
         let fiber_id = reader.read_cstring()?;
-        let fiber_type_code = reader.read_u16_le()?;
-        let wavelength_nm = reader.read_u16_le()? as f64 * 0.1;
-        let location_a = reader.read_cstring()?;
-        let cable_code = reader.read_cstring()?;
-        let build_condition = reader.read_cstring()?;
-        let user_offset_raw = reader.read_i32_le()?;
-
-        let (location_b, user_offset_distance, operator, comments) = if format == 2 {
-            (
-                reader.read_cstring()?,
-                reader.read_i32_le()?,
-                reader.read_cstring()?,
-                reader.read_cstring_opt()?,
-            )
+        let fiber_type_code = if format == 2 {
+            reader.read_u16_le()?
         } else {
-            let operator = reader.read_cstring_opt()?;
-            (String::new(), 0, operator, String::new())
+            0
         };
+        // nominal wavelength is in whole nm here, unlike FxdParams (0.1 nm)
+        let wavelength_nm = f64::from(reader.read_u16_le()?);
+        let location_a = reader.read_cstring()?;
+        let location_b = reader.read_cstring()?;
+        let cable_code = reader.read_cstring()?;
+        let build_condition = reader.read_fixed_str(2)?;
+        let user_offset_raw = reader.read_i32_le()?;
+        let user_offset_distance = if format == 2 {
+            reader.read_i32_le()?
+        } else {
+            0
+        };
+        let operator = reader.read_cstring_opt()?;
+        let comments = reader.read_cstring_opt()?;
 
         Ok(Self {
             language,
@@ -350,33 +352,52 @@ pub struct KeyEvent {
 }
 
 impl KeyEvent {
-    /// True if this is a reflection event (type starts with '1').
+    /// First character of the event code: `0` non-reflective, `1` reflective,
+    /// `2` saturated reflective.
+    fn kind_code(&self) -> Option<char> {
+        self.event_type.chars().next()
+    }
+
+    /// Second character of the event code: `F` found by software, `M` moved by user,
+    /// `A` added by user, `E` end of fiber, `O` out of range.
+    fn mode_code(&self) -> Option<char> {
+        self.event_type.chars().nth(1)
+    }
+
+    /// True for reflective events, including saturated ones.
     pub fn is_reflection(&self) -> bool {
-        self.event_type.starts_with('1')
+        matches!(self.kind_code(), Some('1' | '2'))
     }
 
-    /// True if this is a loss event (type starts with '0').
+    /// True if the reflection saturated the receiver.
+    pub fn is_saturated(&self) -> bool {
+        self.kind_code() == Some('2')
+    }
+
+    /// True if this is a non-reflective (loss/gain) event.
     pub fn is_loss_event(&self) -> bool {
-        self.event_type.starts_with('0')
+        self.kind_code() == Some('0')
     }
 
-    /// True if this is the end of fiber (type starts with 'E' or 'e').
+    /// True if the event marks the end of the fiber.
     pub fn is_end_of_fiber(&self) -> bool {
-        self.event_type.starts_with('E') || self.event_type.starts_with('e')
+        matches!(self.mode_code(), Some('E' | 'e'))
     }
 
-    /// True if the event was detected automatically.
+    /// True if the event was detected automatically and not edited by the user.
     pub fn is_auto(&self) -> bool {
-        !self.event_type.chars().nth(1).is_some_and(|c| c == 'M')
+        !matches!(self.mode_code(), Some('M' | 'A'))
     }
 
     /// Event subtype as a string.
     pub fn subtype_str(&self) -> &'static str {
-        match self.event_type.chars().next() {
+        if self.is_end_of_fiber() {
+            return "end of fiber";
+        }
+        match self.kind_code() {
             Some('0') => "loss/drop/gain",
             Some('1') => "reflection",
-            Some('2') => "multiple events",
-            Some('E') | Some('e') => "end of fiber",
+            Some('2') => "saturated reflection",
             _ => "unknown",
         }
     }
@@ -490,9 +511,7 @@ impl KeyEvents {
         format: u8,
         fxd: Option<&FxdParams>,
     ) -> Result<Self> {
-        let factor = fxd.map_or(1e-4 * SPEED_OF_LIGHT_KM_US / 1.4682, |fp| {
-            fp.distance_factor_km()
-        });
+        let factor = fxd.map_or(1e-4 * SPEED_OF_LIGHT_KM_US / 1.4682, |fp| fp.distance_factor_km());
         let num_events = reader.read_u16_le()? as usize;
         let events = (0..num_events)
             .map(|_| KeyEvent::read_from(reader, format, factor))
@@ -515,7 +534,8 @@ pub struct DataPoints {
     pub raw_data: Vec<u16>,
     /// Distance between points (populated from FxdParams), m.
     pub resolution_m: f64,
-    /// Initial distance (front panel offset), m.
+    /// Distance of the first point from the start of the fiber under test
+    /// (acquisition offset minus user offset), m. Usually negative.
     pub x_offset_m: f64,
 }
 

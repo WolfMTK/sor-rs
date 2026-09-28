@@ -37,40 +37,17 @@ impl<'a> Reader<'a> {
                 data.len()
             )));
         }
-        Ok(Self { data, position: offset, end })
-    }
-
-    /// Creates a sub-reader covering `data[offset..offset + size]`.
-    pub fn slice(&self, offset: usize, size: usize) -> Result<Reader<'a>> {
-        Reader::with_bounds(self.data, offset, size)
-    }
-
-    /// Returns the current absolute position within the underlying buffer.
-    #[inline]
-    pub fn position(&self) -> usize {
-        self.position
+        Ok(Self {
+            data,
+            position: offset,
+            end,
+        })
     }
 
     /// Returns the number of bytes remaining before the end boundary.
     #[inline]
     pub fn remaining(&self) -> usize {
         self.end.saturating_sub(self.position)
-    }
-
-    /// Returns `true` if the current position has reached the end boundary.
-    #[inline]
-    pub fn at_end(&self) -> bool {
-        self.position >= self.end
-    }
-
-    /// Moves the current position to `pos`.
-    pub fn seek(&mut self, position: usize) {
-        self.position = position;
-    }
-
-    /// Returns a shared reference to the full underlying buffer.
-    pub fn all_data(&self) -> &'a [u8] {
-        self.data
     }
 
     /// Reads exactly `n` bytes, advancing the position by `n`.
@@ -85,11 +62,6 @@ impl<'a> Reader<'a> {
         let slice = &self.data[self.position..self.position + num];
         self.position += num;
         Ok(slice)
-    }
-
-    /// Reads one byte.
-    pub fn read_u8(&mut self) -> Result<u8> {
-        Ok(u8::from_le_bytes(self.read_array()?))
     }
 
     /// Reads a little-endian `u16`.
@@ -178,102 +150,53 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::reader::Reader;
     use rstest::rstest;
+
+    use crate::reader::Reader;
 
     fn reader(data: &[u8]) -> Reader<'_> {
         Reader::new(data)
     }
 
     #[rstest]
-    #[case(b"hello", 0, 5, false)]
-    #[case(b"", 0, 0, true)]
-    fn initial_state(
-        #[case] data: &[u8],
-        #[case] position: usize,
-        #[case] remaining: usize,
-        #[case] at_end: bool,
-    ) {
-        let reader = reader(data);
-        assert_eq!(reader.position(), position);
-        assert_eq!(reader.remaining(), remaining);
-        assert_eq!(reader.at_end(), at_end);
+    #[case(b"hello", 5)]
+    #[case(b"", 0)]
+    fn initial_remaining(#[case] data: &[u8], #[case] remaining: usize) {
+        assert_eq!(reader(data).remaining(), remaining);
     }
 
     #[rstest]
-    #[case(b"abcdef", 3, 3, false)]
-    #[case(b"abc", 3, 0, true)]
-    fn seek(
-        #[case] data: &[u8],
-        #[case] to: usize,
-        #[case] remaining: usize,
-        #[case] at_end: bool,
-    ) {
-        let mut reader = reader(data);
-        reader.seek(to);
-        assert_eq!(reader.position(), to);
-        assert_eq!(reader.remaining(), remaining);
-        assert_eq!(reader.at_end(), at_end);
-    }
-
-    #[rstest]
-    fn all_data() {
-        let data = b"abcdef";
-        assert_eq!(reader(data).all_data(), data);
-    }
-
-    #[rstest]
-    fn slice_valid_range() {
-        let reader = reader(b"0123456789");
-        let mut sub = reader.slice(2, 4).unwrap();
-        assert_eq!(sub.position(), 2);
+    fn with_bounds_valid_range() {
+        let mut sub = Reader::with_bounds(b"0123456789", 2, 4).unwrap();
         assert_eq!(sub.remaining(), 4);
         assert_eq!(sub.read_bytes(4).unwrap(), b"2345");
-        assert!(sub.at_end());
+        assert_eq!(sub.remaining(), 0);
     }
 
     #[rstest]
-    fn slice_does_not_modify_parent() {
-        let reader = reader(b"abcdef");
-        let _ = reader.slice(0, 3).unwrap();
-        assert_eq!(reader.position(), 0);
-    }
-
-    #[rstest]
-    fn slice_boundary_enforcement() {
-        let reader = reader(b"AABBCCDD");
-        let mut sub = reader.slice(2, 2).unwrap();
+    fn with_bounds_enforces_end() {
+        let mut sub = Reader::with_bounds(b"AABBCCDD", 2, 2).unwrap();
         assert_eq!(sub.read_bytes(2).unwrap(), b"BB");
         assert!(sub.read_bytes(1).is_err());
     }
 
     #[rstest]
-    fn slice_nested_absolute_offsets() {
-        let reader = reader(b"0123456789");
-        let sub = reader.slice(2, 6).unwrap();
-        let mut inner = sub.slice(6, 2).unwrap();
-        assert_eq!(inner.read_bytes(2).unwrap(), b"67");
+    fn with_bounds_out_of_bounds() {
+        assert!(Reader::with_bounds(b"abc", 1, 10).is_err());
     }
 
     #[rstest]
-    fn slice_out_of_bounds() {
-        assert!(reader(b"abc").slice(1, 10).is_err());
-    }
-
-    #[rstest]
-    #[case(b"abcdef", 3, b"abc", 3, 3)]
-    #[case(b"ab", 2, b"ab", 2, 0)]
-    #[case(b"ab", 0, b"", 0, 2)]
+    #[case(b"abcdef", 3, b"abc", 3)]
+    #[case(b"ab", 2, b"ab", 0)]
+    #[case(b"ab", 0, b"", 2)]
     fn read_bytes(
         #[case] data: &[u8],
         #[case] num: usize,
         #[case] expected: &[u8],
-        #[case] position: usize,
         #[case] remaining: usize,
     ) {
         let mut reader = reader(data);
         assert_eq!(reader.read_bytes(num).unwrap(), expected);
-        assert_eq!(reader.position(), position);
         assert_eq!(reader.remaining(), remaining);
     }
 
@@ -284,17 +207,10 @@ mod tests {
 
     #[rstest]
     fn read_integers_little_endian() {
-        assert_eq!(reader(&[0xAB]).read_u8().unwrap(), 0xAB);
         assert_eq!(reader(&[0x34, 0x12]).read_u16_le().unwrap(), 0x1234);
-        assert_eq!(
-            reader(&[0x78, 0x56, 0x34, 0x12]).read_u32_le().unwrap(),
-            0x1234_5678
-        );
+        assert_eq!(reader(&[0x78, 0x56, 0x34, 0x12]).read_u32_le().unwrap(), 0x1234_5678);
         assert_eq!(reader(&[0xFF, 0xFF]).read_i16_le().unwrap(), -1_i16);
-        assert_eq!(
-            reader(&[0xB1, 0x49, 0xFF, 0xFF]).read_i32_le().unwrap(),
-            -46671_i32
-        );
+        assert_eq!(reader(&[0xB1, 0x49, 0xFF, 0xFF]).read_i32_le().unwrap(), -46671_i32);
     }
 
     #[rstest]
@@ -308,7 +224,7 @@ mod tests {
         let mut reader = reader(&[0x01, 0x00, 0x02, 0x00, 0x00, 0x00]);
         assert_eq!(reader.read_u16_le().unwrap(), 1);
         assert_eq!(reader.read_u32_le().unwrap(), 2);
-        assert!(reader.at_end());
+        assert_eq!(reader.remaining(), 0);
     }
 
     #[rstest]
@@ -325,13 +241,13 @@ mod tests {
     }
 
     #[rstest]
-    #[case(b"Noyes\x00rest", "Noyes", 6)]
-    #[case(b"\x00", "", 1)]
-    #[case(b"  OFL280C-100  \x00", "OFL280C-100", 16)]
-    fn read_cstring(#[case] data: &[u8], #[case] expected: &str, #[case] position: usize) {
+    #[case(b"Noyes\x00rest", "Noyes", 4)]
+    #[case(b"\x00", "", 0)]
+    #[case(b"  OFL280C-100  \x00", "OFL280C-100", 0)]
+    fn read_cstring(#[case] data: &[u8], #[case] expected: &str, #[case] remaining: usize) {
         let mut reader = reader(data);
         assert_eq!(reader.read_cstring().unwrap(), expected);
-        assert_eq!(reader.position(), position);
+        assert_eq!(reader.remaining(), remaining);
     }
 
     #[rstest]
@@ -340,7 +256,7 @@ mod tests {
         assert_eq!(reader.read_cstring().unwrap(), "EN");
         assert_eq!(reader.read_cstring().unwrap(), "C001");
         assert_eq!(reader.read_cstring().unwrap(), "009");
-        assert!(reader.at_end());
+        assert_eq!(reader.remaining(), 0);
     }
 
     #[rstest]
@@ -350,8 +266,7 @@ mod tests {
 
     #[rstest]
     fn read_cstring_respects_boundary() {
-        let reader = reader(b"hello\x00world");
-        let mut sub = reader.slice(0, 5).unwrap();
+        let mut sub = Reader::with_bounds(b"hello\x00world", 0, 5).unwrap();
         assert!(sub.read_cstring().is_err());
     }
 }
